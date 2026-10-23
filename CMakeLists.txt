@@ -4,6 +4,11 @@ project(mcaat)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Fresh submodule checkouts need the cycle-search accessor until a forked
+# MEGAHIT revision includes it. Apply before any dependency configuration.
+include(cmake/PrepareMegahit.cmake)
+mcaat_prepare_megahit()
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 
 find_package(ZLIB)

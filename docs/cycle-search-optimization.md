@@ -91,7 +91,13 @@ The accessor uses a constant template branch compatible with the library's
 older C++ callers; the new MCAAT search kernel requires C++17.
 
 Until a fork URL and commit are supplied, `.gitmodules` and the submodule
-commit remain unchanged. On a clean checkout of the pinned dependency, apply:
+commit remain unchanged. Root CMake configuration now applies this patch
+automatically when the accessors are missing, before configuring dependencies.
+Already-patched headers are left alone. An incompatible local edit produces
+an actionable configuration error instead of cascading compiler errors; the
+build never resets the submodule or discards edits.
+
+For an older checkout without this configuration fix, apply manually:
 
 ```sh
 git -C libs/megahit apply ../../patches/megahit-cycle-multiplicity.patch
