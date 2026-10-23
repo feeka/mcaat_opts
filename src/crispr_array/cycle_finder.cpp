@@ -1,4 +1,9 @@
 #include "crispr_array/cycle_finder.h"
+#include "crispr_array/bounded_cycle_search.h"
+#include <algorithm>
+#include <limits>
+#include <climits>
+#include <type_traits>
 #include "crispr_array/filters.h"
 #include "core/settings.h"
 #include <stdexcept>
@@ -139,6 +144,9 @@ CycleFinder::CycleFinder(Settings& settings)
     // Ensure settings.sdbg is valid; this should be set by caller before constructing CycleFinder
     if (this->settings.sdbg == nullptr) {
         throw std::runtime_error("CycleFinder requires settings.sdbg to be set to a valid SDBG instance");
+    }
+    if (settings.threads == 0 || settings.threads > static_cast<size_t>(INT_MAX)) {
+        throw std::invalid_argument("CycleFinder requires a valid positive thread count");
     }
     this->FindApproximateCRISPRArrays();
 }
@@ -353,165 +361,42 @@ bool CycleFinder::DepthLevelSearch(uint64_t start, uint64_t target, int limit, i
 }
 
 
-/**
- * @brief Bidirectional BFS to determine if a cycle through `start` exists within `limit` hops.
- * Expands a forward frontier (outgoing edges) and a backward frontier (incoming edges)
- * simultaneously. A cycle is confirmed when the two frontiers share a node, or when the
- * forward frontier reaches `start` itself.
- * Memory: O(b^(limit/2)) visited nodes total vs O(b^limit) for the DLS.
- */
+namespace {
+template <class NodeId>
+using CycleSearchScratch = mcaat::cycle_search::Scratch<
+    NodeId, phmap::flat_hash_set<NodeId>>;
+
+// mul_t is uint16_t in the pinned MEGAHIT dependency: ceil(log2(m)) is 0..16.
+unsigned MultiplicityBucket(mul_t multiplicity) {
+    unsigned bucket = 0;
+    for (unsigned remaining = multiplicity > 0 ? multiplicity - 1 : 0;
+         remaining != 0; remaining >>= 1) ++bucket;
+    return bucket;
+}
+}
+
 bool CycleFinder::BidirectionalBFS(uint64_t start, int limit) {
-    const int tid = omp_get_thread_num();
-    auto& fwd_bits = per_thread_visited[tid];
-    auto& fwd_dirty = per_thread_dirty[tid];
-
-    // Dirty indices address bitmap words, not nodes.
-    // Fall back to full reset if word indices exceed 32 bits.
-    const bool track_dirty = fwd_bits.empty() ||
-        static_cast<uint64_t>(fwd_bits.size() - 1) <= UINT32_MAX;
-
-    if (track_dirty) {
-        for (uint32_t w : fwd_dirty) fwd_bits[w] = 0ULL;
-    } else {
-        std::fill(fwd_bits.begin(), fwd_bits.end(), 0ULL);
-    }
-    fwd_dirty.clear();
-
-    auto fwd_test = [&](uint64_t node) -> bool {
-        return (fwd_bits[node >> 6] >> (node & 63)) & 1ULL;
-    };
-
-    auto fwd_mark = [&](uint64_t node) {
-        const uint64_t w = node >> 6;
-        auto& word = fwd_bits[w];
-
-        // Record each touched word exactly once.
-        if (track_dirty && word == 0ULL)
-            fwd_dirty.push_back(static_cast<uint32_t>(w));
-
-        word |= 1ULL << (node & 63);
-    };
-
-    // Dispatch once per call; SDBG API calls remain 64-bit.
-    auto search = [&](auto id_tag) -> bool {
-        using NodeId = decltype(id_tag);
-
-        static thread_local phmap::flat_hash_set<NodeId> bwd_visited;
-        static thread_local std::vector<NodeId> fwd_frontier;
-        static thread_local std::vector<NodeId> bwd_frontier;
-        static thread_local std::vector<NodeId> next_frontier;
-
-        bwd_visited.clear();
-        fwd_frontier.clear();
-        bwd_frontier.clear();
-        next_frontier.clear();
-
-        const auto start_multiplicity =
-            settings.sdbg->EdgeMultiplicity(start);
-
-        fwd_mark(start);
-        bwd_visited.insert(static_cast<NodeId>(start));
-        fwd_frontier.push_back(static_cast<NodeId>(start));
-        bwd_frontier.push_back(static_cast<NodeId>(start));
-
-        uint64_t neighbors[MAX_EDGE_COUNT];
-
-        // Preserve the original search bounds and return values.
-        const int half = limit / 2 + 1;
-
-        for (int depth = 0; depth < half; ++depth) {
-            const bool last_round = depth == half - 1;
-            bool found_new_forward = false;
-            next_frontier.clear();
-
-            for (NodeId stored_v : fwd_frontier) {
-                const uint64_t v = stored_v;
-                if (!settings.sdbg->IsValidEdge(v)) continue;
-                if (settings.sdbg->EdgeOutdegreeZero(v)) continue;
-
-                const int degree =
-                    settings.sdbg->OutgoingEdges(v, neighbors);
-
-                for (int i = 0; i < degree; ++i) {
-                    const uint64_t nb = neighbors[i];
-                    if (!settings.sdbg->IsValidEdge(nb)) continue;
-
-                    const auto multiplicity =
-                        settings.sdbg->EdgeMultiplicity(nb);
-
-                    if (multiplicity == 0 ||
-                        start_multiplicity / multiplicity > 500)
-                        continue;
-
-                    if (nb == start ||
-                        bwd_visited.count(static_cast<NodeId>(nb)))
-                        return true;
-
-                    if (!fwd_test(nb)) {
-                        fwd_mark(nb);
-                        found_new_forward = true;
-
-                        // Final forward discoveries need visited bits
-                        // for intersection checks, but no new frontier.
-                        if (!last_round)
-                            next_frontier.push_back(
-                                static_cast<NodeId>(nb));
-                    }
-                }
-            }
-
-            if (!found_new_forward) return false;
-            if (!last_round)
-                fwd_frontier.swap(next_frontier);
-
-            next_frontier.clear();
-
-            for (NodeId stored_v : bwd_frontier) {
-                const uint64_t v = stored_v;
-                if (!settings.sdbg->IsValidEdge(v)) continue;
-                if (settings.sdbg->EdgeIndegreeZero(v)) continue;
-
-                const int degree =
-                    settings.sdbg->IncomingEdges(v, neighbors);
-
-                for (int i = 0; i < degree; ++i) {
-                    const uint64_t nb = neighbors[i];
-                    if (!settings.sdbg->IsValidEdge(nb)) continue;
-
-                    const auto multiplicity =
-                        settings.sdbg->EdgeMultiplicity(nb);
-
-                    if (multiplicity == 0 ||
-                        start_multiplicity / multiplicity > 500)
-                        continue;
-
-                    if (fwd_test(nb)) return true;
-
-                    // Final backward discoveries are never queried or
-                    // expanded afterward, so only check intersections.
-                    if (!last_round &&
-                        bwd_visited.insert(
-                            static_cast<NodeId>(nb)).second) {
-                        next_frontier.push_back(
-                            static_cast<NodeId>(nb));
-                    }
-                }
-            }
-
-            if (last_round) return false;
-
-            bwd_frontier.swap(next_frontier);
-            if (bwd_frontier.empty()) return false;
-        }
-
+    const SDBG& graph = *settings.sdbg;
+    if (limit < 1 || start >= graph.size() || !graph.IsValidEdge(start))
         return false;
+    const mul_t minimum = graph.EdgeMultiplicity(start) / 501u + 1u;
+    auto dispatch = [&](auto id_tag, auto storage_tag) {
+        using NodeId = decltype(id_tag);
+        constexpr bool full = decltype(storage_tag)::value;
+        // Standalone API calls reuse scratch without sharing enumeration state.
+        static thread_local CycleSearchScratch<NodeId> scratch;
+        auto allowed = [&](uint64_t id) {
+            return graph.CycleMultiplicityAtLeast<full>(id, minimum);
+        };
+        return mcaat::cycle_search::exists(graph, start, limit, allowed, scratch);
     };
-
-    const uint64_t node_count = settings.sdbg->size();
-    if (node_count != 0 && node_count - 1 <= UINT32_MAX)
-        return search(uint32_t{0});
-
-    return search(uint64_t{0});
+    const bool small_ids = graph.size() == 0 || graph.size() - 1 <= UINT32_MAX;
+    if (graph.HasFullMultiplicityStorage()) {
+        return small_ids ? dispatch(uint32_t{}, std::true_type{})
+                         : dispatch(uint64_t{}, std::true_type{});
+    }
+    return small_ids ? dispatch(uint32_t{}, std::false_type{})
+                     : dispatch(uint64_t{}, std::false_type{});
 }
 
 vector<uint64_t> CycleFinder::CollectTips() {
@@ -574,57 +459,120 @@ void CycleFinder::InvalidateMultiplicityOneNodes() {
 /**
  * @brief Chunks the start nodes based on their multiplicity for parallel processing.
  */
-size_t CycleFinder::ChunkStartNodes(map<int, vector<uint64_t>, greater<int>>& start_nodes_chunked) {
-    const int chunk_size = 20000;
-    if(!this->settings.cycle_finder_settings.low_abundance){
-        this->InvalidateMultiplicityOneNodes();
-    }
-    size_t n = this->settings.sdbg->size();
-    int threads = static_cast<int>(this->settings.threads);
+size_t CycleFinder::ChunkStartNodes(
+    map<int, vector<uint64_t>, greater<int>>& start_nodes_chunked) {
+    if (settings.threads == 0 || settings.threads > static_cast<size_t>(INT_MAX))
+        throw std::invalid_argument("Cycle search requires a valid positive thread count");
+    if (!settings.cycle_finder_settings.low_abundance)
+        InvalidateMultiplicityOneNodes();
 
-    // Per-thread chunk collectors to avoid global critical regions
-    vector<unordered_map<int, vector<uint64_t>>> local_chunks(threads);
-    std::atomic<uint64_t> loaded(0);
+    // All graph mutation is complete before this region. The adjacency API
+    // filters invalid IDs, and cached seed neighbors remain valid throughout it.
+    const SDBG& graph = *settings.sdbg;
+    const uint64_t n = graph.size();
+    const int threads = static_cast<int>(settings.threads);
+    const int limit = settings.cycle_finder_settings.cycle_max_length;
+    const uint64_t threshold = settings.cycle_finder_settings.threshold_multiplicity;
+    if (limit < 1 || n == 0) return 0;
 
-    #pragma omp parallel num_threads(threads)
-    {
-        int tid = omp_get_thread_num();
-        #pragma omp for schedule(dynamic, chunk_size)
-        for (uint64_t node = 0; node < n; node++) {
-            if(!this->settings.sdbg->IsValidEdge(node)) continue;
-            size_t edge_indegree = this->settings.sdbg->EdgeIndegree(node);
-            uint64_t my_loaded = loaded.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (my_loaded % 1000000 == 0) std::cout << "  ▸ Scanning: " << (my_loaded / 1000000) << "M nodes..." << std::endl;
-            if (edge_indegree >= 2 && this->settings.sdbg->EdgeMultiplicity(node) > this->settings.cycle_finder_settings.threshold_multiplicity)
-            {
-                if(this->_IncomingNotEqualToCurrentNode(node, edge_indegree)) continue;
-                int reached_depth = 0;
-
-                bool dls = this->BidirectionalBFS(node, this->settings.cycle_finder_settings.cycle_max_length);
-                if(!dls) continue;
-                int log2_mult = static_cast<int>(ceil(log2(double(this->settings.sdbg->EdgeMultiplicity(node)))));
-                local_chunks[tid][log2_mult].push_back(node);
+    struct Seed {
+        uint64_t id;
+        uint64_t incomings[4];
+        mul_t multiplicity;
+        int incoming_count;
+    };
+    struct alignas(64) WorkerResults {
+        vector<Seed> candidates;
+        array<vector<uint64_t>, 17> buckets;
+    };
+    vector<WorkerResults> workers(threads);
+    vector<size_t> offsets(threads + 1);
+    vector<Seed> batch;
+    // Bounded staging: even if every ID is eligible, neither candidate buffer
+    // grows with the whole graph. Search scheduling is independent of scan cost.
+    constexpr uint64_t scan_window = 262144;
+    auto dispatch = [&](auto id_tag, auto storage_tag) {
+        using NodeId = decltype(id_tag);
+        constexpr bool full = decltype(storage_tag)::value;
+        #pragma omp parallel num_threads(threads)
+        {
+            const int tid = omp_get_thread_num();
+            auto& worker = workers[tid];
+            CycleSearchScratch<NodeId> scratch;  // Lazy allocation by its owner.
+            for (uint64_t begin = 0; begin < n;) {
+                const uint64_t batch_end = begin + std::min(scan_window, n - begin);
+                worker.candidates.clear();
+                #pragma omp for schedule(static)
+                for (uint64_t id = begin; id < batch_end; ++id) {
+                    if (!graph.IsValidEdge(id)) continue;
+                    const mul_t multiplicity = graph.EdgeMultiplicity(id);
+                    if (multiplicity <= threshold) continue;
+                    Seed seed{};
+                    seed.id = id;
+                    seed.multiplicity = multiplicity;
+                    seed.incoming_count = graph.IncomingEdges(id, seed.incomings);
+                    if (seed.incoming_count < 2) continue;
+                    bool self_loop = false;
+                    for (int i = 0; i < seed.incoming_count; ++i)
+                        self_loop |= seed.incomings[i] == id;
+                    if (!self_loop) worker.candidates.push_back(seed);
+                }
+                #pragma omp single
+                {
+                    offsets[0] = 0;
+                    for (int t = 0; t < threads; ++t)
+                        offsets[t + 1] = offsets[t] + workers[t].candidates.size();
+                    batch.resize(offsets[threads]);
+                }
+                std::copy(worker.candidates.begin(), worker.candidates.end(),
+                          batch.begin() + offsets[tid]);
+                #pragma omp barrier
+                #pragma omp for schedule(dynamic, 4)
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    const Seed& seed = batch[i];
+                    const mul_t minimum = seed.multiplicity / 501u + 1u;
+                    auto allowed = [&](uint64_t id) {
+                        return graph.CycleMultiplicityAtLeast<full>(id, minimum);
+                    };
+                    if (mcaat::cycle_search::exists(graph, seed.id, limit, allowed,
+                            scratch, seed.incomings, seed.incoming_count))
+                        worker.buckets[MultiplicityBucket(seed.multiplicity)]
+                            .push_back(seed.id);
+                }
+                // The worksharing barrier above finishes this batch before reuse.
+                begin = batch_end;
             }
         }
+    };
+    const bool small_ids = n - 1 <= UINT32_MAX;
+    if (graph.HasFullMultiplicityStorage()) {
+        if (small_ids) dispatch(uint32_t{}, std::true_type{});
+        else dispatch(uint64_t{}, std::true_type{});
+    } else {
+        if (small_ids) dispatch(uint32_t{}, std::false_type{});
+        else dispatch(uint64_t{}, std::false_type{});
     }
 
-    // Merge local chunks into the shared map (serial merge to avoid contention)
-    for (int t = 0; t < threads; ++t) {
-        for (auto &entry : local_chunks[t]) {
-            auto &vec = start_nodes_chunked[entry.first];
-            vec.insert(vec.end(), entry.second.begin(), entry.second.end());
-        }
+    size_t total = 0;
+    for (unsigned bucket = 0; bucket < 17; ++bucket) {
+        size_t count = 0;
+        for (const auto& worker : workers) count += worker.buckets[bucket].size();
+        if (count == 0) continue;
+        auto& out = start_nodes_chunked[static_cast<int>(bucket)];
+        out.reserve(out.size() + count);
+        for (auto& worker : workers)
+            out.insert(out.end(), worker.buckets[bucket].begin(),
+                       worker.buckets[bucket].end());
+        // Search completion order must not determine subsequent root order.
+        std::sort(out.begin(), out.end());
     }
-
-   //writeStartNodesToFile(start_nodes_chunked, "start_nodes.txt");
-    size_t sum_of_all_quantities_in_all_chunks = 0;
-    for (const auto& [key, value] : start_nodes_chunked) {
-        std::cout << "  ▸ Bucket mult\u00d7" << (1 << key) << " (log2=" << key << "): " << value.size() << " nodes" << std::endl;
-        sum_of_all_quantities_in_all_chunks += value.size();
+    for (const auto& entry : start_nodes_chunked) {
+        total += entry.second.size();
+        std::cout << "  ▸ Bucket log2=" << entry.first << ": "
+                  << entry.second.size() << " nodes" << std::endl;
     }
-    return sum_of_all_quantities_in_all_chunks;
-} 
-
+    return total;
+}
 
 /**
  * @brief Finds all cycles in the graph by iterating over chunked start nodes and utilizing parallel processing.
@@ -639,7 +587,7 @@ int CycleFinder::FindApproximateCRISPRArrays()
     for ( uint64_t tip : tips) {
         this->RecursiveReduction(tip);
     }
-    int valid_edges = 0;
+    uint64_t valid_edges = 0;
     #pragma omp parallel for reduction(+:valid_edges)
     for (uint64_t node = 0; node < this->settings.sdbg->size(); node++) {
         if (this->settings.sdbg->IsValidEdge(node)) {
@@ -657,28 +605,28 @@ int CycleFinder::FindApproximateCRISPRArrays()
               << "  threads=" << this->settings.threads << std::endl;
         std::unordered_map<uint64_t, std::vector<std::vector<uint64_t>>> all_cycles;
 
-    // Allocate visited bitsets before ChunkStartNodes so BFS/DLS can reuse them.
-    int max_threads = static_cast<int>(this->settings.threads);
-    size_t words = (this->settings.sdbg->size() + 63) / 64;
+    map<int, vector<uint64_t>, greater<int>> start_nodes_chunked;
+    const size_t start_nodes_amount = ChunkStartNodes(start_nodes_chunked);
+    std::cout << "  ▸ Start nodes: " << start_nodes_amount << std::endl;
+
+    // Enumeration has independent state; BFS worker scratch has been released.
+    const int max_threads = static_cast<int>(settings.threads);
+    const uint64_t node_count = settings.sdbg->size();
+    const size_t words = node_count / 64 + (node_count % 64 != 0);
     per_thread_visited.resize(max_threads);
     per_thread_dirty.resize(max_threads);
-    for (auto &v : per_thread_visited) v.assign(words, 0);
-    {
-        size_t mb = (words * 8 * max_threads) / (1024 * 1024);
-        std::cout << "  ▸ Memory estimate: visited bitset " << max_threads << " threads x "
-                  << (words * 8 / (1024 * 1024)) << " MB = " << mb << " MB ("
-                  << (mb / 1024) << " GB)" << std::endl;
+    #pragma omp parallel for num_threads(max_threads) schedule(static, 1)
+    for (int t = 0; t < max_threads; ++t) {
+        per_thread_visited[t].assign(words, 0);
+        per_thread_dirty[t].clear();
     }
-
-    map<int, vector<uint64_t>, greater<int>> start_nodes_chunked;
-    size_t start_nodes_amount=this->ChunkStartNodes(start_nodes_chunked);
-    std::cout << "  ▸ Start nodes: " << start_nodes_amount << std::endl;
     size_t counter = 0;
     for (auto nodes_iterator = start_nodes_chunked.begin(); nodes_iterator != start_nodes_chunked.end(); nodes_iterator++) {
         // Reset visited bitmaps so nodes from a higher-multiplicity bucket don't
         // block traversal in lower-multiplicity buckets.
-        for (auto &v : per_thread_visited)
-            std::fill(v.begin(), v.end(), 0);
+        #pragma omp parallel for num_threads(max_threads) schedule(static, 1)
+        for (int t = 0; t < max_threads; ++t)
+            std::fill(per_thread_visited[t].begin(), per_thread_visited[t].end(), 0);
         size_t cumulative_at_bucket_start = cumulative;
         auto thread_count = static_cast<int>(this->settings.threads);
         if (static_cast<int>(nodes_iterator->second.size()) < thread_count)

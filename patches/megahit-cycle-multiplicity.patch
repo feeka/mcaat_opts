@@ -1,0 +1,29 @@
+diff --git a/src/sdbg/sdbg.h b/src/sdbg/sdbg.h
+index c194324..6b52eb4 100644
+--- a/src/sdbg/sdbg.h
++++ b/src/sdbg/sdbg.h
+@@ -104,6 +104,24 @@ class SDBG {
+     }
+   }
+ 
++  // Dispatch the storage layout once outside a batch of cycle searches.
++  bool HasFullMultiplicityStorage() const { return !content_.full_mul.empty(); }
++
++  // Exact predicate for floor(root_multiplicity / neighbor_multiplicity) <= 500.
++  // Callers convert the root to minimum = root / 501 + 1 (range 1..131).
++  // Compact sentinel 255 denotes values >=254, all above this threshold;
++  // therefore no large_mul lookup is needed. Zero fails automatically.
++  template <bool FullStorage>
++  bool CycleMultiplicityAtLeast(uint64_t edge_id, mul_t minimum) const {
++    assert(minimum >= 1 && minimum <= kMaxMul / 501 + 1);
++    assert(FullStorage == HasFullMultiplicityStorage());
++    if (FullStorage) {
++      return content_.full_mul[edge_id] >= minimum;
++    } else {
++      return content_.small_mul[edge_id] >= minimum;
++    }
++  }
++
+   uint64_t Forward(uint64_t edge_id) const {  // the last edge edge_id points to
+     uint8_t a = GetW(edge_id);
+     if (a > kAlphabetSize) {

@@ -36,6 +36,9 @@ find_package(OpenMP REQUIRED)
 option(STATIC_BUILD "Build static executable"      OFF)
 option(SANITIZER    "Enable address/UB sanitizers" OFF)
 option(ENABLE_DEBUG "Enable DEBUG macro (dev main)" OFF)
+option(MCAAT_NATIVE_ARCH "Tune release code for the build machine CPU" ON)
+option(MCAAT_ENABLE_IPO "Enable compiler-supported link-time optimization" OFF)
+option(MCAAT_AGGRESSIVE_LOOPS "Force loop unrolling and automatic prefetching" OFF)
 
 if(ENABLE_DEBUG)
     add_definitions(-DDEBUG)
@@ -50,10 +53,12 @@ endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DXXH_INLINE_ALL -ftemplate-depth=3000")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-function")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprefetch-loop-arrays -funroll-loops")
+if(MCAAT_AGGRESSIVE_LOOPS)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprefetch-loop-arrays -funroll-loops")
+endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+# Keep CMake/toolchain release defaults instead of overwriting user flags.
 set(CMAKE_CXX_FLAGS_DEBUG   "-g -ggdb -O1 -D_GLIBCXX_DEBUG")
 
 if(SANITIZER)
@@ -120,6 +125,19 @@ set(MEGAHIT_SOURCES
 # ── Executable: mcaat ─────────────────────────────────────────────────────────
 
 add_executable(mcaat ${MAIN_SOURCE} ${MEGAHIT_SOURCES})
+
+if(MCAAT_NATIVE_ARCH AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(mcaat PRIVATE "$<$<CONFIG:Release>:-march=native>")
+endif()
+
+if(MCAAT_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT MCAAT_IPO_SUPPORTED OUTPUT MCAAT_IPO_ERROR)
+    if(NOT MCAAT_IPO_SUPPORTED)
+        message(FATAL_ERROR "IPO requested but unavailable: ${MCAAT_IPO_ERROR}")
+    endif()
+    set_property(TARGET mcaat PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
 
 target_link_libraries(mcaat PRIVATE
     ${ZLIB_LIBRARIES}
