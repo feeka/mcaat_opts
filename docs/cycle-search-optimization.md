@@ -9,7 +9,7 @@ The new detection kernel answers whether there is a nonempty simple cycle
 through the requested root with length **at most** the supplied bound, under
 the existing root-multiplicity predicate. It does not enforce minimum length
 and does not enumerate paths. Graph validity and multiplicity must remain
-unchanged while a search or candidate batch is running.
+unchanged throughout the candidate-detection phase.
 
 Self-loops are accepted by the standalone detector when the bound is at least
 one. Candidate selection retains the existing policy: multiplicity strictly
@@ -43,20 +43,21 @@ intersections and does not retain discoveries that will never be used.
   zero-degree and validity checks. SDBG itself still validates neighbors.
 - Root predicate converted exactly to `neighbor >= root / 501 + 1`.
 - MEGAHIT compact-multiplicity comparisons avoid its large-value hash table;
-  layout is dispatched outside the search batch.
-- 32-/64-bit frontier IDs selected once per batch.
+  layout is dispatched outside the candidate-detection phase.
+- 32-/64-bit frontier IDs selected once per candidate-detection phase.
 - Explicit worker scratch, a forward bitmap reset through touched words,
   an exact flat backward set, and reusable frontier vectors.
 - Owner-thread allocation of BFS bitmap storage. BFS scratch is released
   before enumeration bitmap allocation in the normal pipeline.
-- One persistent OpenMP team across bounded scan windows; contiguous static
-  candidate scanning and dynamic batches of four root searches.
-- A scan window contains at most 262144 IDs. Candidate staging is bounded by
-  this window, rather than by the whole input graph.
+- One persistent OpenMP team with continuous dynamic worksharing in chunks of
+  20000 graph IDs, matching the original chunk size. No candidate-window barriers,
+  candidate staging arrays, or candidate-record copies.
 - Root multiplicity and incoming neighbors reused from candidate selection.
 - No per-node atomic progress counter or worker-side progress printing.
-- Fixed multiplicity buckets, integer bucket calculation, reserved merging,
-  and sorted accepted-root IDs for stable downstream ordering.
+- Fixed multiplicity buckets, integer bucket calculation, and reserved merging.
+  Results merge in worker order without an additional global candidate sort.
+- Separate wall-clock summaries for candidate scanning/BFS/merging, enumeration,
+  and serialization/result copying. Candidate counts are worker-local.
 - Positive thread-count validation and a 64-bit valid-edge statistic.
 - Optional release IPO/LTO, optional forced loop unrolling/prefetching, and
   an explicit native-CPU build option. User release flags are no longer replaced.
@@ -65,15 +66,15 @@ intersections and does not retain discoveries that will never be used.
 
 The forward bitmap still costs one bit per global graph ID per active worker.
 Hash/frontier storage depends on search size and retains its capacity until the
-worker exits the batch phase. There is no total-RAM admission controller or
-external-memory fallback. Candidate staging is bounded; accepted-root output
-and total search memory are not claimed to be bounded independently of input.
+worker exits the detection phase. There is no total-RAM admission controller or
+external-memory fallback. Accepted-root output and total search memory are not
+claimed to be bounded independently of input.
 
 The later enumerator is not rewritten here. Its existing cycle caps,
 worker-history suppression, narrowing of relaxation IDs, and result retention
-still require a separate correctness change. Stable root ordering can change
-its output relative to the old scheduling-dependent ordering; thread-count
-independence of final array output is not claimed.
+still require a separate correctness change. Root ordering remains dependent
+on worker assignment, as in the original scheduler. Thread-count independence
+or byte-for-byte reproduction of final array output is not claimed.
 
 The following measurement-dependent proposals are not enabled automatically:
 new hash/bitmap representations, graph caches, compressed paths, multi-root
@@ -127,7 +128,7 @@ ctest --test-dir build/cycle-tests --output-on-failure
 
 Tests use explicit failures rather than `assert`, so Release does not disable
 their checks. These tests do not cover actual SDBG files, the phmap backend,
-or the OpenMP batching wrapper. Also validate compact/full multiplicity storage
+or the OpenMP scheduling wrapper. Also validate compact/full multiplicity storage
 (especially 0, threshold boundaries, 253, 254, 255, 65535), candidate sets
 across worker counts, and full-build integration on the server before use.
 
@@ -143,3 +144,20 @@ cmake --build build/release --parallel 4
 Build on the execution CPU or disable `MCAAT_NATIVE_ARCH` for portable builds.
 IPO is optional and configuration reports an error when requested but unsupported.
 Do not interpret either configuration as a measured speedup.
+
+## Runtime regression follow-up
+
+The first optimization revision introduced a global barrier after each window
+of 262144 scanned IDs, plus a global sort of accepted IDs. The user reported a
+slowdown. The actual slow phase and measurements have not yet been supplied,
+so its cause is not established. The window barriers, staging copies, and sort
+have been removed conservatively; cheap timers now separate detection,
+enumeration, and output. This correction has not been compiled or benchmarked.
+
+Other variables still requiring controlled comparison are adaptive direction
+selection, the changed compiler-loop flags, worker count, build configuration,
+bitmap allocation/placement, and enumeration order. The cycle detector's exact
+upper bound also differs from the old permissive bound. Compare candidate and
+output counts alongside runtime. Use the same saved graph, thread count, and
+server load for detector comparisons; whole FASTQ runs also time graph building.
+Do not infer a successful speedup from removal of overhead alone.

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <climits>
+#include <chrono>
 #include <type_traits>
 #include "crispr_array/filters.h"
 #include "core/settings.h"
@@ -475,22 +476,15 @@ size_t CycleFinder::ChunkStartNodes(
     const uint64_t threshold = settings.cycle_finder_settings.threshold_multiplicity;
     if (limit < 1 || n == 0) return 0;
 
-    struct Seed {
-        uint64_t id;
-        uint64_t incomings[4];
-        mul_t multiplicity;
-        int incoming_count;
-    };
+    const auto detection_started = std::chrono::steady_clock::now();
     struct alignas(64) WorkerResults {
-        vector<Seed> candidates;
         array<vector<uint64_t>, 17> buckets;
+        uint64_t candidates = 0;
     };
     vector<WorkerResults> workers(threads);
-    vector<size_t> offsets(threads + 1);
-    vector<Seed> batch;
-    // Bounded staging: even if every ID is eligible, neither candidate buffer
-    // grows with the whole graph. Search scheduling is independent of scan cost.
-    constexpr uint64_t scan_window = 262144;
+    // Restore the original continuous worksharing schedule. A slow root holds
+    // its worker, not a global window barrier that prevents all other progress.
+    constexpr int scan_chunk = 20000;
     auto dispatch = [&](auto id_tag, auto storage_tag) {
         using NodeId = decltype(id_tag);
         constexpr bool full = decltype(storage_tag)::value;
@@ -498,49 +492,27 @@ size_t CycleFinder::ChunkStartNodes(
         {
             const int tid = omp_get_thread_num();
             auto& worker = workers[tid];
-            CycleSearchScratch<NodeId> scratch;  // Lazy allocation by its owner.
-            for (uint64_t begin = 0; begin < n;) {
-                const uint64_t batch_end = begin + std::min(scan_window, n - begin);
-                worker.candidates.clear();
-                #pragma omp for schedule(static)
-                for (uint64_t id = begin; id < batch_end; ++id) {
-                    if (!graph.IsValidEdge(id)) continue;
-                    const mul_t multiplicity = graph.EdgeMultiplicity(id);
-                    if (multiplicity <= threshold) continue;
-                    Seed seed{};
-                    seed.id = id;
-                    seed.multiplicity = multiplicity;
-                    seed.incoming_count = graph.IncomingEdges(id, seed.incomings);
-                    if (seed.incoming_count < 2) continue;
-                    bool self_loop = false;
-                    for (int i = 0; i < seed.incoming_count; ++i)
-                        self_loop |= seed.incomings[i] == id;
-                    if (!self_loop) worker.candidates.push_back(seed);
-                }
-                #pragma omp single
-                {
-                    offsets[0] = 0;
-                    for (int t = 0; t < threads; ++t)
-                        offsets[t + 1] = offsets[t] + workers[t].candidates.size();
-                    batch.resize(offsets[threads]);
-                }
-                std::copy(worker.candidates.begin(), worker.candidates.end(),
-                          batch.begin() + offsets[tid]);
-                #pragma omp barrier
-                #pragma omp for schedule(dynamic, 4)
-                for (size_t i = 0; i < batch.size(); ++i) {
-                    const Seed& seed = batch[i];
-                    const mul_t minimum = seed.multiplicity / 501u + 1u;
-                    auto allowed = [&](uint64_t id) {
-                        return graph.CycleMultiplicityAtLeast<full>(id, minimum);
-                    };
-                    if (mcaat::cycle_search::exists(graph, seed.id, limit, allowed,
-                            scratch, seed.incomings, seed.incoming_count))
-                        worker.buckets[MultiplicityBucket(seed.multiplicity)]
-                            .push_back(seed.id);
-                }
-                // The worksharing barrier above finishes this batch before reuse.
-                begin = batch_end;
+            CycleSearchScratch<NodeId> scratch;
+            #pragma omp for schedule(dynamic, scan_chunk)
+            for (uint64_t id = 0; id < n; ++id) {
+                if (!graph.IsValidEdge(id)) continue;
+                const mul_t multiplicity = graph.EdgeMultiplicity(id);
+                if (multiplicity <= threshold) continue;
+                uint64_t incomings[4];
+                const int incoming_count = graph.IncomingEdges(id, incomings);
+                if (incoming_count < 2) continue;
+                bool self_loop = false;
+                for (int i = 0; i < incoming_count; ++i)
+                    self_loop |= incomings[i] == id;
+                if (self_loop) continue;
+                ++worker.candidates;
+                const mul_t minimum = multiplicity / 501u + 1u;
+                auto allowed = [&](uint64_t neighbor) {
+                    return graph.CycleMultiplicityAtLeast<full>(neighbor, minimum);
+                };
+                if (mcaat::cycle_search::exists(graph, id, limit, allowed,
+                        scratch, incomings, incoming_count))
+                    worker.buckets[MultiplicityBucket(multiplicity)].push_back(id);
             }
         }
     };
@@ -563,14 +535,18 @@ size_t CycleFinder::ChunkStartNodes(
         for (auto& worker : workers)
             out.insert(out.end(), worker.buckets[bucket].begin(),
                        worker.buckets[bucket].end());
-        // Search completion order must not determine subsequent root order.
-        std::sort(out.begin(), out.end());
     }
     for (const auto& entry : start_nodes_chunked) {
         total += entry.second.size();
         std::cout << "  ▸ Bucket log2=" << entry.first << ": "
                   << entry.second.size() << " nodes" << std::endl;
     }
+    uint64_t candidates = 0;
+    for (const auto& worker : workers) candidates += worker.candidates;
+    const double detection_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - detection_started).count();
+    std::cout << "  ▸ Candidate scan + BFS + merge: " << detection_seconds
+              << " s; tested " << candidates << "; accepted " << total << std::endl;
     return total;
 }
 
@@ -609,6 +585,7 @@ int CycleFinder::FindApproximateCRISPRArrays()
     const size_t start_nodes_amount = ChunkStartNodes(start_nodes_chunked);
     std::cout << "  ▸ Start nodes: " << start_nodes_amount << std::endl;
 
+    const auto enumeration_started = std::chrono::steady_clock::now();
     // Enumeration has independent state; BFS worker scratch has been released.
     const int max_threads = static_cast<int>(settings.threads);
     const uint64_t node_count = settings.sdbg->size();
@@ -672,9 +649,18 @@ int CycleFinder::FindApproximateCRISPRArrays()
         std::cout << "  ▸ Total: " << cumulative << " cycles across "
               << this->results.size() << " start nodes" << std::endl;
 
+    std::cout << "  ▸ Enumeration including scratch initialization: "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                               enumeration_started).count()
+              << " s" << std::endl;
+    const auto output_started = std::chrono::steady_clock::now();
     const std::string cycles_path = this->settings.output_folder + "/cycles.txt";
     this->writeMapToFile(this->results, cycles_path);
     this->settings.cycles = this->results;
+    std::cout << "  ▸ Cycle serialization + result copy: "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                               output_started).count()
+              << " s" << std::endl;
 
     return cumulative;
 }
