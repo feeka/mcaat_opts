@@ -81,7 +81,10 @@ class CycleFinder {
         int MultiCycleDepthLevelSearch(uint64_t start, uint64_t target, int limit, int min_cycles);
         void writeMapToFile(const std::unordered_map<uint64_t,  std::vector<std::vector<uint64_t>>>& cycles, const std::string& filename);
         //#### DLS ####
-        size_t ChunkStartNodes(map<int, vector<uint64_t>, std::greater<int>>& start_nodes_chunked);
+        // Standalone calls retain preprocessing. The normal pipeline passes false
+        // after its upfront multiplicity filter; tip pruning only invalidates edges.
+        size_t ChunkStartNodes(map<int, vector<uint64_t>, std::greater<int>>& start_nodes_chunked,
+                              bool apply_multiplicity_filter = true);
         bool DepthLevelSearch(uint64_t start, uint64_t target, int limit, int& reached_depth);
         // Exact nonempty-cycle existence with an inclusive upper length bound.
         // Does not enforce cycle_min_length; graph must remain immutable.

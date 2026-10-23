@@ -1,6 +1,7 @@
 #include "crispr_array/cycle_finder.h"
 #include "crispr_array/bounded_cycle_search.h"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <climits>
 #include <chrono>
@@ -461,10 +462,11 @@ void CycleFinder::InvalidateMultiplicityOneNodes() {
  * @brief Chunks the start nodes based on their multiplicity for parallel processing.
  */
 size_t CycleFinder::ChunkStartNodes(
-    map<int, vector<uint64_t>, greater<int>>& start_nodes_chunked) {
+    map<int, vector<uint64_t>, greater<int>>& start_nodes_chunked,
+    bool apply_multiplicity_filter) {
     if (settings.threads == 0 || settings.threads > static_cast<size_t>(INT_MAX))
         throw std::invalid_argument("Cycle search requires a valid positive thread count");
-    if (!settings.cycle_finder_settings.low_abundance)
+    if (apply_multiplicity_filter && !settings.cycle_finder_settings.low_abundance)
         InvalidateMultiplicityOneNodes();
 
     // All graph mutation is complete before this region. The adjacency API
@@ -484,7 +486,13 @@ size_t CycleFinder::ChunkStartNodes(
     vector<WorkerResults> workers(threads);
     // Restore the original continuous worksharing schedule. A slow root holds
     // its worker, not a global window barrier that prevents all other progress.
-    constexpr int scan_chunk = 20000;
+    constexpr uint64_t scan_chunk = 20000;
+    const uint64_t chunk_count = n / scan_chunk + (n % scan_chunk != 0);
+    constexpr uint64_t report_interval = 1000000;
+    std::atomic<uint64_t> completed_valid{0};
+    uint64_t reported_valid = 0;  // Accessed only inside the reporting critical region.
+    std::cout << "  ▸ Scanning candidates with " << threads << " workers..."
+              << std::endl;
     auto dispatch = [&](auto id_tag, auto storage_tag) {
         using NodeId = decltype(id_tag);
         constexpr bool full = decltype(storage_tag)::value;
@@ -493,26 +501,54 @@ size_t CycleFinder::ChunkStartNodes(
             const int tid = omp_get_thread_num();
             auto& worker = workers[tid];
             CycleSearchScratch<NodeId> scratch;
-            #pragma omp for schedule(dynamic, scan_chunk)
-            for (uint64_t id = 0; id < n; ++id) {
-                if (!graph.IsValidEdge(id)) continue;
-                const mul_t multiplicity = graph.EdgeMultiplicity(id);
-                if (multiplicity <= threshold) continue;
-                uint64_t incomings[4];
-                const int incoming_count = graph.IncomingEdges(id, incomings);
-                if (incoming_count < 2) continue;
-                bool self_loop = false;
-                for (int i = 0; i < incoming_count; ++i)
-                    self_loop |= incomings[i] == id;
-                if (self_loop) continue;
-                ++worker.candidates;
-                const mul_t minimum = multiplicity / 501u + 1u;
-                auto allowed = [&](uint64_t neighbor) {
-                    return graph.CycleMultiplicityAtLeast<full>(neighbor, minimum);
-                };
-                if (mcaat::cycle_search::exists(graph, id, limit, allowed,
-                        scratch, incomings, incoming_count))
-                    worker.buckets[MultiplicityBucket(multiplicity)].push_back(id);
+            // One scheduled iteration still covers 20000 contiguous graph IDs.
+            // Publish progress once after a chunk completes, never per node.
+            #pragma omp for schedule(dynamic, 1)
+            for (uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
+                const uint64_t begin = chunk * scan_chunk;
+                const uint64_t end = begin + std::min(scan_chunk, n - begin);
+                uint64_t valid_in_chunk = 0;
+                for (uint64_t id = begin; id < end; ++id) {
+                    if (!graph.IsValidEdge(id)) continue;
+                    ++valid_in_chunk;
+                    const mul_t multiplicity = graph.EdgeMultiplicity(id);
+                    if (multiplicity <= threshold) continue;
+                    uint64_t incomings[4];
+                    const int incoming_count = graph.IncomingEdges(id, incomings);
+                    if (incoming_count < 2) continue;
+                    bool self_loop = false;
+                    for (int i = 0; i < incoming_count; ++i)
+                        self_loop |= incomings[i] == id;
+                    if (self_loop) continue;
+                    ++worker.candidates;
+                    const mul_t minimum = multiplicity / 501u + 1u;
+                    auto allowed = [&](uint64_t neighbor) {
+                        return graph.CycleMultiplicityAtLeast<full>(neighbor, minimum);
+                    };
+                    if (mcaat::cycle_search::exists(graph, id, limit, allowed,
+                            scratch, incomings, incoming_count))
+                        worker.buckets[MultiplicityBucket(multiplicity)].push_back(id);
+                }
+                if (valid_in_chunk == 0) continue;
+                const uint64_t previous = completed_valid.fetch_add(
+                    valid_in_chunk, std::memory_order_relaxed);
+                if (previous / report_interval !=
+                    (previous + valid_in_chunk) / report_interval) {
+                    #pragma omp critical(mcaat_cycle_scan_progress)
+                    {
+                        const uint64_t completed = completed_valid.load(
+                            std::memory_order_relaxed);
+                        // Another reporter may have already printed this milestone.
+                        if (completed / report_interval > reported_valid / report_interval) {
+                            reported_valid = completed;
+                            const double seconds = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - detection_started).count();
+                            std::cout << "  ▸ Scanning: " << completed
+                                      << " valid edges checked; elapsed " << seconds
+                                      << " s" << std::endl;
+                        }
+                    }
+                }
             }
         }
     };
@@ -546,7 +582,8 @@ size_t CycleFinder::ChunkStartNodes(
     const double detection_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - detection_started).count();
     std::cout << "  ▸ Candidate scan + BFS + merge: " << detection_seconds
-              << " s; tested " << candidates << "; accepted " << total << std::endl;
+              << " s; valid edges checked " << completed_valid.load(std::memory_order_relaxed)
+              << "; tested " << candidates << "; accepted " << total << std::endl;
     return total;
 }
 
@@ -582,7 +619,9 @@ int CycleFinder::FindApproximateCRISPRArrays()
         std::unordered_map<uint64_t, std::vector<std::vector<uint64_t>>> all_cycles;
 
     map<int, vector<uint64_t>, greater<int>> start_nodes_chunked;
-    const size_t start_nodes_amount = ChunkStartNodes(start_nodes_chunked);
+    // The upfront filter already invalidated every edge of multiplicity <= 1.
+    // Tip pruning only invalidates more edges; it changes no multiplicities.
+    const size_t start_nodes_amount = ChunkStartNodes(start_nodes_chunked, false);
     std::cout << "  ▸ Start nodes: " << start_nodes_amount << std::endl;
 
     const auto enumeration_started = std::chrono::steady_clock::now();

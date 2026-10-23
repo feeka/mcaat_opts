@@ -53,7 +53,14 @@ intersections and does not retain discoveries that will never be used.
   20000 graph IDs, matching the original chunk size. No candidate-window barriers,
   candidate staging arrays, or candidate-record copies.
 - Root multiplicity and incoming neighbors reused from candidate selection.
-- No per-node atomic progress counter or worker-side progress printing.
+- Progress is published with at most one relaxed atomic addition per completed
+  20000-ID chunk. Approximately every million completed valid edges, a reporting
+  critical region prints the count and elapsed scan time. Other workers continue
+  processing; there is no global reporting barrier or per-node atomic counter.
+- The normal pipeline skips the second multiplicity-filter pass: its earlier
+  filter already invalidates all edges with multiplicity <= 1, and intervening
+  tip pruning only invalidates edges. Standalone candidate selection retains its
+  preprocessing default. The existing upfront low-abundance policy is unchanged.
 - Fixed multiplicity buckets, integer bucket calculation, and reserved merging.
   Results merge in worker order without an additional global candidate sort.
 - Separate wall-clock summaries for candidate scanning/BFS/merging, enumeration,
@@ -149,8 +156,7 @@ Do not interpret either configuration as a measured speedup.
 
 The first optimization revision introduced a global barrier after each window
 of 262144 scanned IDs, plus a global sort of accepted IDs. The user reported a
-slowdown. The actual slow phase and measurements have not yet been supplied,
-so its cause is not established. The window barriers, staging copies, and sort
+slowdown in scanning. The window barriers, staging copies, and sort
 have been removed conservatively; cheap timers now separate detection,
 enumeration, and output. This correction has not been compiled or benchmarked.
 
@@ -161,3 +167,35 @@ upper bound also differs from the old permissive bound. Compare candidate and
 output counts alongside runtime. Use the same saved graph, thread count, and
 server load for detector comparisons; whole FASTQ runs also time graph building.
 Do not infer a successful speedup from removal of overhead alone.
+
+### Progress reporting and comparable inputs
+
+The supplied run logs describe different graphs: 1099909480 versus 904132355
+total IDs, and 495151953 versus 325217706 valid edges after pruning. The first
+has about 22% more total IDs and 52% more surviving edges. Neither log includes
+the completed scan time. The previous optimized revision did not print progress
+while scanning, so its silence cannot be compared with the original build's
+million-edge messages. These logs do not establish either a speedup or a slowdown.
+
+Progress now counts valid root edges in completed chunks, including roots that
+fail candidate selection. It does not count BFS discoveries or accepted roots.
+It can lag by the unfinished chunks (up to 20000 IDs per worker). Chunks can
+complete out of ID order; the reported count is not a highest visited node ID.
+Printing is serialized only among milestone reporters, and concurrent milestones
+may be combined into one newer count. The final summary reports the exact total.
+
+The repeated filter shown in both logs counts every low-multiplicity edge again,
+including already-invalid ones. Skipping that second pass in the normal pipeline
+removes a full scan without changing the graph presented to candidate selection.
+It does not establish the cause of any slowdown inside BFS.
+
+Compare both binaries sequentially on the exact same saved graph, with matching
+26 threads, length bounds, multiplicity threshold, and low-abundance setting.
+Use separate output directories and `--autoclean false` to retain graph data.
+Compare scan completion times and counts rather than matching progress messages
+from different graphs. Loading times in the supplied logs (22.0 versus 5820.3
+seconds) are also very different; storage/cache/environment causes have not been
+measured, and those times must be kept separate from cycle scanning.
+
+The progress/filter change has been inspected statically only; no build, test,
+or graph processing was run on the user's Mac.
