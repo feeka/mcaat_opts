@@ -5,11 +5,12 @@ Base MEGAHIT submodule: `5f329c6d24a1480b75145a4c14567a25453b95bf`.
 
 ## Contract and behavior
 
-The new detection kernel answers whether there is a nonempty simple cycle
-through the requested root with length **at most** the supplied bound, under
-the existing root-multiplicity predicate. It does not enforce minimum length
-and does not enumerate paths. Graph validity and multiplicity must remain
-unchanged throughout the candidate-detection phase.
+The standalone `exists` kernel and `CycleFinder::BidirectionalBFS` answer whether
+there is a nonempty simple cycle through the requested root with length **at
+most** the supplied bound, under the existing root-multiplicity predicate.
+Production candidate selection now calls `exists_in_range`: it retains a root
+only when a simple cycle through that root satisfies **both inclusive bounds**.
+Graph validity and multiplicity must remain unchanged throughout detection.
 
 Self-loops are accepted by the standalone detector when the bound is at least
 one. Candidate selection retains the existing policy: multiplicity strictly
@@ -36,9 +37,34 @@ not completeness. An opposite-side hit already certifies admissibility, so
 no multiplicity lookup is needed for that hit. The final layer only checks
 intersections and does not retain discoveries that will never be used.
 
+The first intersection also gives the shortest cycle length: before the last
+expansion, every shorter path would have intersected the prior visited balls.
+If this length is already in the configured range, candidate selection accepts
+immediately. No cycle within the maximum proves rejection. A shorter cycle is
+inconclusive: that same root may also belong to a qualifying longer cycle.
+
+For that last case, bounded reachability first checks for at least `minimum`
+distinct admissible vertices in each direction (including the root). Either
+search exhausting below this count proves that no qualifying simple cycle
+exists. Each direction stops at the count and visits at most `minimum - 1`
+adjacency lists; it does not build a whole-graph component index.
+
+Remaining ambiguous roots use iterative, path-sensitive DFS up to `maximum`
+vertices. A path-local bitmap prohibits repeated vertices. Every outgoing edge
+of every admissible simple prefix is considered; only a closing edge to the
+root at a permitted length succeeds. A short closure is skipped while other
+branches remain searchable. This neither accepts repeated laps of a short cycle
+nor rejects a root merely because its shortest cycle is too short. There is no
+candidate-count limit or search-step cutoff in this eligibility check.
+
 ## Implemented
 
 - Smaller-frontier expansion with exact combined-depth accounting.
+- Range-aware candidate admission, with a shortest-cycle fast path, bounded
+  reachability rejection, and exact simple-path checking for ambiguous roots.
+  A summary reports roots with too-short shortest cycles, how many were rejected
+  for lacking any cycle in range, and how many needed the exact path search.
+  These counters are worker-local and merged after scanning.
 - One SDBG adjacency call per expanded vertex, without caller-side duplicate
   zero-degree and validity checks. SDBG itself still validates neighbors.
 - Root predicate converted exactly to `neighbor >= root / 501 + 1`.
@@ -77,7 +103,14 @@ worker exits the detection phase. There is no total-RAM admission controller or
 external-memory fallback. Accepted-root output and total search memory are not
 claimed to be bounded independently of input.
 
-The later enumerator is not rewritten here. Its existing cycle caps,
+The range fallback can take exponential time in the maximum length on branching
+graphs. Its path stack adds O(maximum) memory and reuses the existing bitmap;
+there is no second whole-graph bitmap for it. Fewer retained roots are not a
+guarantee of a shorter scan or a specific final candidate count.
+
+The later enumerator's minimum-length comparison is now inclusive, matching
+candidate eligibility and the displayed settings. It is otherwise not rewritten.
+Its existing cycle caps,
 worker-history suppression, narrowing of relaxation IDs, and result retention
 still require a separate correctness change. Root ordering remains dependent
 on worker assignment, as in the original scheduler. Thread-count independence
@@ -124,6 +157,11 @@ directed graphs on four vertices, every root, and bounds zero through five,
 for both ID widths. They also cover cached incoming neighbors, predicate masks,
 invalid vertices, self-loops, strict odd/even bounds, reused state, bitmap word
 boundaries, graph resizing, and rejecting too-narrow IDs before allocation.
+The same exhaustive oracle checks now cover the shortest returned length and
+every minimum through one beyond the maximum. Additional cases exercise
+short-only cycles, misleading long tails, a root shared by a two-cycle and a
+27-cycle, and predicate/validity rejection of its longer path. Cached incoming
+neighbors are exercised for both detector APIs and both ID widths.
 
 Run only on the intended execution machine:
 
@@ -199,3 +237,17 @@ measured, and those times must be kept separate from cycle scanning.
 
 The progress/filter change has been inspected statically only; no build, test,
 or graph processing was run on the user's Mac.
+
+### Candidate eligibility correction
+
+After a report of 27154 versus 3001814 accepted roots, the user requested a
+correction to candidate admission rather than another benchmark comparison.
+The old and initial optimized prefilters both ignored the configured minimum
+cycle length. Candidate selection now requires a genuine cycle in the requested
+range before retaining the root, while preserving roots that have both short
+and qualifying cycles. This closes a concrete over-admission path; it does not
+establish that short-only cycles caused the entire reported count difference.
+
+The new range code and regression tests have been inspected statically, but
+have not been compiled, executed, or benchmarked on the user's Mac. Run the
+standalone correctness checks on the execution server before graph processing.

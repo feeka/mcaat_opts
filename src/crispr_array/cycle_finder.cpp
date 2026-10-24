@@ -172,7 +172,8 @@ vector<vector<uint64_t>> CycleFinder::FindCycle(uint64_t start_node, vector<uint
             current_node = neighbor;
             if (current_node == start_node ) {
                 backtrack_lengths.back() = 1;
-                if (path.size() > static_cast<size_t>(this->settings.cycle_finder_settings.cycle_min_length)) {
+                if (path.size() >= static_cast<size_t>(std::max(1,
+                        this->settings.cycle_finder_settings.cycle_min_length))) {
                     cycles.push_back(path);
                     counter += 1;
                     if (counter >= this->cluster_bounds) {
@@ -475,13 +476,15 @@ size_t CycleFinder::ChunkStartNodes(
     const uint64_t n = graph.size();
     const int threads = static_cast<int>(settings.threads);
     const int limit = settings.cycle_finder_settings.cycle_max_length;
+    const int minimum_length = std::max(1, settings.cycle_finder_settings.cycle_min_length);
     const uint64_t threshold = settings.cycle_finder_settings.threshold_multiplicity;
-    if (limit < 1 || n == 0) return 0;
+    if (limit < minimum_length || n < static_cast<uint64_t>(minimum_length)) return 0;
 
     const auto detection_started = std::chrono::steady_clock::now();
     struct alignas(64) WorkerResults {
         array<vector<uint64_t>, 17> buckets;
         uint64_t candidates = 0;
+        mcaat::cycle_search::RangeStats range_stats;
     };
     vector<WorkerResults> workers(threads);
     // Restore the original continuous worksharing schedule. A slow root holds
@@ -525,8 +528,9 @@ size_t CycleFinder::ChunkStartNodes(
                     auto allowed = [&](uint64_t neighbor) {
                         return graph.CycleMultiplicityAtLeast<full>(neighbor, minimum);
                     };
-                    if (mcaat::cycle_search::exists(graph, id, limit, allowed,
-                            scratch, incomings, incoming_count))
+                    if (mcaat::cycle_search::exists_in_range(graph, id,
+                            minimum_length, limit, allowed, scratch,
+                            incomings, incoming_count, &worker.range_stats))
                         worker.buckets[MultiplicityBucket(multiplicity)].push_back(id);
                 }
                 if (valid_in_chunk == 0) continue;
@@ -578,12 +582,22 @@ size_t CycleFinder::ChunkStartNodes(
                   << entry.second.size() << " nodes" << std::endl;
     }
     uint64_t candidates = 0;
-    for (const auto& worker : workers) candidates += worker.candidates;
+    mcaat::cycle_search::RangeStats range_stats;
+    for (const auto& worker : workers) {
+        candidates += worker.candidates;
+        range_stats.shorter_cycle_roots += worker.range_stats.shorter_cycle_roots;
+        range_stats.no_in_range_cycle += worker.range_stats.no_in_range_cycle;
+        range_stats.path_search_roots += worker.range_stats.path_search_roots;
+    }
     const double detection_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - detection_started).count();
     std::cout << "  ▸ Candidate scan + BFS + merge: " << detection_seconds
               << " s; valid edges checked " << completed_valid.load(std::memory_order_relaxed)
               << "; tested " << candidates << "; accepted " << total << std::endl;
+    std::cout << "  ▸ Range check: " << range_stats.shorter_cycle_roots
+              << " roots with shortest cycle below " << minimum_length
+              << "; rejected without an in-range cycle " << range_stats.no_in_range_cycle
+              << "; required exact path search " << range_stats.path_search_roots << std::endl;
     return total;
 }
 
