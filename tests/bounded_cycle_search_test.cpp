@@ -8,16 +8,19 @@ namespace search = mcaat::cycle_search;
 struct Graph {
     std::vector<std::vector<uint64_t>> edges;
     std::vector<bool> valid;
+    mutable uint64_t adjacency_calls = 0;
     explicit Graph(size_t n) : edges(n), valid(n, true) {}
     uint64_t size() const { return edges.size(); }
     bool IsValidEdge(uint64_t v) const { return valid.at(v); }
     int OutgoingEdges(uint64_t v, uint64_t* out) const {
+        ++adjacency_calls;
         if (!valid.at(v)) return -1;
         int count = 0;
         for (uint64_t w : edges.at(v)) if (valid.at(w)) out[count++] = w;
         return count;
     }
     int IncomingEdges(uint64_t v, uint64_t* out) const {
+        ++adjacency_calls;
         if (!valid.at(v)) return -1;
         int count = 0;
         for (uint64_t u = 0; u < size(); ++u)
@@ -71,20 +74,27 @@ void check(const Graph& g, uint64_t root, int limit, const Allowed& allowed,
     }
     require(search::shortest_cycle_length(g, root, limit, allowed, scratch) == shortest,
             "Shortest cycle length disagrees with oracle");
+    auto check_status = [&](search::CandidateStatus status, int minimum) {
+        const bool in_range = oracle(g, root, limit, allowed, minimum);
+        require(!in_range || status != search::CandidateStatus::Rejected,
+                "Prefilter discarded a root with a qualifying cycle");
+        require(status != search::CandidateStatus::Confirmed || in_range,
+                "Prefilter claimed an in-range cycle without a witness");
+        require(status != search::CandidateStatus::NeedsEnumeration ||
+                    (shortest > 0 && shortest < std::max(1, minimum)),
+                "Only roots with shorter cycles should remain unresolved");
+    };
     for (int minimum = 0; minimum <= std::max(1, limit + 1); ++minimum)
-        require(search::exists_in_range(g, root, minimum, limit, allowed, scratch) ==
-                    oracle(g, root, limit, allowed, minimum),
-                "Range detector disagrees with simple-path oracle");
+        check_status(search::classify_candidate(g, root, minimum, limit, allowed, scratch),
+                     minimum);
     if (root < g.size() && g.valid[root]) {
         uint64_t incoming[4];
         const int count = g.IncomingEdges(root, incoming);
         require(search::exists(g, root, limit, allowed, scratch, incoming, count) == expected,
                 "Cached incoming-neighbor path disagrees with oracle");
         for (int minimum = 0; minimum <= std::max(1, limit + 1); ++minimum)
-            require(search::exists_in_range(g, root, minimum, limit, allowed,
-                        scratch, incoming, count) ==
-                        oracle(g, root, limit, allowed, minimum),
-                    "Cached range detector disagrees with oracle");
+            check_status(search::classify_candidate(g, root, minimum, limit, allowed,
+                        scratch, incoming, count), minimum);
     }
 }
 
@@ -144,7 +154,8 @@ void run() {
     Graph short_only(80);
     short_only.edges[0] = {1};
     short_only.edges[1] = {0};
-    require(!search::exists_in_range(short_only, 0, 27, 77, all, scratch),
+    require(search::classify_candidate(short_only, 0, 27, 77, all, scratch) ==
+                search::CandidateStatus::Rejected,
             "A two-cycle cannot qualify by taking repeated laps");
 
     // Large outgoing reachability does not mean there are enough vertices
@@ -153,12 +164,14 @@ void run() {
     tail.edges[0] = {1, 2};
     tail.edges[1] = {0};
     for (uint64_t v = 2; v < 79; ++v) tail.edges[v] = {v + 1};
-    require(!search::exists_in_range(tail, 0, 27, 77, all, scratch),
+    require(search::classify_candidate(tail, 0, 27, 77, all, scratch) ==
+                search::CandidateStatus::Rejected,
             "A long outgoing tail must not inflate the cycle length");
     Graph reverse_tail(80);
     for (uint64_t v = 0; v < tail.size(); ++v)
         for (uint64_t w : tail.edges[v]) reverse_tail.edges[w].push_back(v);
-    require(!search::exists_in_range(reverse_tail, 0, 27, 77, all, scratch),
+    require(search::classify_candidate(reverse_tail, 0, 27, 77, all, scratch) ==
+                search::CandidateStatus::Rejected,
             "A long incoming tail must not inflate the cycle length");
 
     // Rejecting a root just because its shortest cycle is too short is unsound.
@@ -168,16 +181,43 @@ void run() {
     mixed.edges[1] = {0};
     for (uint64_t v = 2; v < 27; ++v) mixed.edges[v] = {v + 1};
     mixed.edges[27] = {0};
-    require(search::exists_in_range(mixed, 0, 27, 77, all, scratch),
+    require(search::classify_candidate(mixed, 0, 27, 77, all, scratch) !=
+                search::CandidateStatus::Rejected,
             "A short cycle must not hide a qualifying longer cycle");
-    require(!search::exists_in_range(mixed, 0, 28, 77, all, scratch),
-            "Neither cycle meets a minimum above 27");
+    require(search::classify_candidate(mixed, 0, 28, 77, all, scratch) ==
+                search::CandidateStatus::NeedsEnumeration,
+            "Inconclusive necessary conditions must not claim an in-range cycle");
     auto blocked_long_path = [](uint64_t id) { return id != 14; };
-    require(!search::exists_in_range(mixed, 0, 27, 77, blocked_long_path, scratch),
-            "The range fallback must apply the multiplicity predicate");
+    require(search::classify_candidate(mixed, 0, 27, 77, blocked_long_path, scratch) ==
+                search::CandidateStatus::Rejected,
+            "The prefilter must apply the multiplicity predicate");
     mixed.valid[14] = false;
-    require(!search::exists_in_range(mixed, 0, 27, 77, all, scratch),
-            "The range fallback must respect graph validity");
+    require(search::classify_candidate(mixed, 0, 27, 77, all, scratch) ==
+                search::CandidateStatus::Rejected,
+            "The prefilter must respect graph validity");
+
+    // Regression: 2^50 outgoing path choices, but the only root cycle has length 2.
+    // The separate incoming tail makes both bounded reachability tests inconclusive.
+    // Do NOT run the path-enumerating oracle on this graph: the prefilter must defer
+    // without exploring those paths. Its adjacency work has an explicit bound.
+    constexpr uint64_t levels = 50;
+    constexpr uint64_t tail_begin = 2 + 2 * levels;
+    Graph exponential(tail_begin + 30);
+    exponential.edges[0] = {1, 2, 3};
+    exponential.edges[1] = {0};
+    for (uint64_t layer = 0; layer + 1 < levels; ++layer) {
+        const uint64_t node = 2 + 2 * layer;
+        exponential.edges[node] = {node + 2, node + 3};
+        exponential.edges[node + 1] = {node + 2, node + 3};
+    }
+    for (uint64_t node = tail_begin; node + 1 < exponential.size(); ++node)
+        exponential.edges[node] = {node + 1};
+    exponential.edges.back() = {0};
+    require(search::classify_candidate(exponential, 0, 27, 77, all, scratch) ==
+                search::CandidateStatus::NeedsEnumeration,
+            "Ambiguous branching graph must be deferred without a simple-path search");
+    require(exponential.adjacency_calls <= 2 + 2 * (27 - 1),
+            "Short-cycle prefilter exceeded its adjacency-work bound");
 }
 
 int main() {

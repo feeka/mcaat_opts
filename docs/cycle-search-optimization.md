@@ -8,8 +8,9 @@ Base MEGAHIT submodule: `5f329c6d24a1480b75145a4c14567a25453b95bf`.
 The standalone `exists` kernel and `CycleFinder::BidirectionalBFS` answer whether
 there is a nonempty simple cycle through the requested root with length **at
 most** the supplied bound, under the existing root-multiplicity predicate.
-Production candidate selection now calls `exists_in_range`: it retains a root
-only when a simple cycle through that root satisfies **both inclusive bounds**.
+Production candidate selection calls `classify_candidate`, a conservative
+prefilter with three outcomes: rejected, confirmed in range, or unresolved and
+retained for enumeration. Retention is not proof of a cycle meeting the minimum.
 Graph validity and multiplicity must remain unchanged throughout detection.
 
 Self-loops are accepted by the standalone detector when the bound is at least
@@ -49,21 +50,22 @@ search exhausting below this count proves that no qualifying simple cycle
 exists. Each direction stops at the count and visits at most `minimum - 1`
 adjacency lists; it does not build a whole-graph component index.
 
-Remaining ambiguous roots use iterative, path-sensitive DFS up to `maximum`
-vertices. A path-local bitmap prohibits repeated vertices. Every outgoing edge
-of every admissible simple prefix is considered; only a closing edge to the
-root at a permitted length succeeds. A short closure is skipped while other
-branches remain searchable. This neither accepts repeated laps of a short cycle
-nor rejects a root merely because its shortest cycle is too short. There is no
-candidate-count limit or search-step cutoff in this eligibility check.
+Remaining ambiguous roots return `NeedsEnumeration` immediately. Scanning does
+not explore simple paths. Each rejection has a proof; an inconclusive necessary
+condition never rejects a root. Therefore a root with any qualifying cycle is
+retained, but false-positive candidates remain possible. The minimum is enforced
+later on the paths already produced by the existing enumerator. This avoids
+performing exponential path exploration twice. It adds no candidate cap or
+heuristic cutoff. Removing unresolved roots without further evidence is unsound.
 
 ## Implemented
 
 - Smaller-frontier expansion with exact combined-depth accounting.
-- Range-aware candidate admission, with a shortest-cycle fast path, bounded
-  reachability rejection, and exact simple-path checking for ambiguous roots.
-  A summary reports roots with too-short shortest cycles, how many were rejected
-  for lacking any cycle in range, and how many needed the exact path search.
+- Candidate classification with a shortest-cycle fast path and bounded
+  reachability rejection. Ambiguous roots are deferred, never explored by DFS.
+  A summary reports small-region rejections, confirmed in-range roots, and
+  unresolved roots retained for enumeration. `Start nodes` includes both retained
+  categories and is explicitly labeled as a prefilter candidate count.
   These counters are worker-local and merged after scanning.
 - One SDBG adjacency call per expanded vertex, without caller-side duplicate
   zero-degree and validity checks. SDBG itself still validates neighbors.
@@ -103,13 +105,17 @@ worker exits the detection phase. There is no total-RAM admission controller or
 external-memory fallback. Accepted-root output and total search memory are not
 claimed to be bounded independently of input.
 
-The range fallback can take exponential time in the maximum length on branching
-graphs. Its path stack adds O(maximum) memory and reuses the existing bitmap;
-there is no second whole-graph bitmap for it. Fewer retained roots are not a
-guarantee of a shorter scan or a specific final candidate count.
+The exponential range fallback introduced in `db035fe` has been removed,
+including its path stack. For a root with a too-short shortest cycle, the extra
+pruning performs at most `2 * (minimum - 1)` adjacency calls (52 at minimum 27),
+with at most `minimum` discovered vertices per direction. This bound is only for
+the additional pruning; BFS itself still depends on graph topology, and SDBG
+adjacency costs are not constant machine instructions. The later enumerator can
+still be expensive. A specific candidate count or end-to-end runtime is not
+guaranteed by this recovery patch.
 
-The later enumerator's minimum-length comparison is now inclusive, matching
-candidate eligibility and the displayed settings. It is otherwise not rewritten.
+The later enumerator's minimum-length comparison remains inclusive, matching
+the displayed settings. It is otherwise not rewritten.
 Its existing cycle caps,
 worker-history suppression, narrowing of relaxation IDs, and result retention
 still require a separate correctness change. Root ordering remains dependent
@@ -157,11 +163,17 @@ directed graphs on four vertices, every root, and bounds zero through five,
 for both ID widths. They also cover cached incoming neighbors, predicate masks,
 invalid vertices, self-loops, strict odd/even bounds, reused state, bitmap word
 boundaries, graph resizing, and rejecting too-narrow IDs before allocation.
-The same exhaustive oracle checks now cover the shortest returned length and
-every minimum through one beyond the maximum. Additional cases exercise
+The same exhaustive oracle checks cover the shortest returned length and
+every minimum through one beyond the maximum. They verify that no qualifying
+root is rejected and no nonexistent in-range cycle is reported as confirmed;
+unresolved roots are explicitly permitted. Additional cases exercise
 short-only cycles, misleading long tails, a root shared by a two-cycle and a
 27-cycle, and predicate/validity rejection of its longer path. Cached incoming
-neighbors are exercised for both detector APIs and both ID widths.
+neighbors are exercised for both detector APIs and both ID widths. A separate
+regression graph has 2^50 outgoing path choices and only a two-cycle through the
+root, plus a separate incoming tail. The prefilter must defer that graph using
+at most 54 adjacency calls, including its two-call BFS seed check. The test does
+not invoke the exponential reference oracle on that graph.
 
 Run only on the intended execution machine:
 
@@ -238,15 +250,23 @@ measured, and those times must be kept separate from cycle scanning.
 The progress/filter change has been inspected statically only; no build, test,
 or graph processing was run on the user's Mac.
 
-### Candidate eligibility correction
+### Failed candidate eligibility change and recovery
 
 After a report of 27154 versus 3001814 accepted roots, the user requested a
 correction to candidate admission rather than another benchmark comparison.
 The old and initial optimized prefilters both ignored the configured minimum
-cycle length. Candidate selection now requires a genuine cycle in the requested
-range before retaining the root, while preserving roots that have both short
-and qualifying cycles. This closes a concrete over-admission path; it does not
-establish that short-only cycles caused the entire reported count difference.
+cycle length. Commit `db035fe` attempted an exact range-existence check before
+retaining a root. This introduced exponential simple-path search into scanning.
+The user subsequently reported 106963.4 seconds (29.7 hours) for 16008940 valid
+edges out of 495151953 (3.23%). This was an inappropriate algorithmic change for
+the scan and has been removed. The supplied timings do not contain a profiler
+breakdown, but the unbounded path-exploration fallback is not retained pending
+one. Correctness tests alone would not establish acceptable production cost.
+
+The recovery preserves the fast BFS, bounded necessary-condition pruning,
+progress reporting, and the inclusive minimum check in enumeration. It removes
+the DFS fallback and makes unresolved status explicit. The original candidate
+count anomaly is not claimed solved; graph-dependent extra candidates can remain.
 
 The new range code and regression tests have been inspected statically, but
 have not been compiled, executed, or benchmarked on the user's Mac. Run the

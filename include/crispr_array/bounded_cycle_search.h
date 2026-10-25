@@ -14,9 +14,12 @@ namespace cycle_search {
 
 struct RangeStats {
     uint64_t shorter_cycle_roots = 0;
-    uint64_t no_in_range_cycle = 0;
-    uint64_t path_search_roots = 0;
+    uint64_t rejected_small_region = 0;
+    uint64_t confirmed_roots = 0;
+    uint64_t needs_enumeration = 0;
 };
+
+enum class CandidateStatus { Rejected, Confirmed, NeedsEnumeration };
 
 // One owner per scratch object. The graph must not mutate during a search.
 // BackwardSet is an exact set with clear/count/insert (flat_hash_set in production).
@@ -29,13 +32,6 @@ struct Scratch {
     std::vector<WordId> dirty_words;
     BackwardSet backward_seen;
     std::vector<NodeId> forward, backward, next;
-    struct PathFrame {
-        NodeId node;
-        NodeId neighbors[4];
-        uint8_t count = 0;
-        uint8_t next = 0;
-    };
-    std::vector<PathFrame> path;
 
     void reset(uint64_t node_count) {
         if (node_count && node_count - 1 > std::numeric_limits<NodeId>::max())
@@ -46,16 +42,12 @@ struct Scratch {
             forward_bits.assign(words, 0);
         } else {
             for (WordId word : dirty_words) forward_bits[word] = 0;
-            // Also recover cleanly if an allocation exception interrupted DFS.
-            for (const auto& frame : path)
-                forward_bits[frame.node >> 6] &= ~(uint64_t{1} << (frame.node & 63));
         }
         dirty_words.clear();
         backward_seen.clear();
         forward.clear();
         backward.clear();
         next.clear();
-        path.clear();
     }
 
     bool forward_contains(uint64_t id) const {
@@ -195,80 +187,41 @@ bool enough_reachable_nodes(const Graph& graph, uint64_t start, std::size_t requ
     return false;
 }
 
-// Admit a root only if a SIMPLE cycle through it has length in [minimum, maximum].
-// A too-short cycle cannot qualify, but cannot rule out a longer valid cycle.
-// BFS resolves no-cycle roots and roots whose shortest cycle is already in range.
-// Only roots with a shorter cycle need the exact, path-sensitive fallback below.
-// Its worst-case work is exponential in maximum; there is no heuristic cutoff.
+// Conservative candidate classification, NOT an exact range-existence decision.
+// A too-short cycle neither qualifies nor rules out a longer valid cycle.
+// After BFS, perform at most 2*(minimum-1) additional adjacency calls. If these
+// bounded necessary conditions cannot reject the root, defer it to enumeration.
+// Never enumerate simple paths in this scan or interpret unresolved as rejected.
 template <class Graph, class Predicate, class NodeId, class Set>
-bool exists_in_range(const Graph& graph, uint64_t start, int minimum, int maximum,
-                     const Predicate& allowed, Scratch<NodeId, Set>& scratch,
-                     const uint64_t* incomings = nullptr, int incoming_count = 0,
-                     RangeStats* statistics = nullptr) {
+CandidateStatus classify_candidate(const Graph& graph, uint64_t start,
+                                    int minimum, int maximum,
+                                    const Predicate& allowed, Scratch<NodeId, Set>& scratch,
+                                    const uint64_t* incomings = nullptr,
+                                    int incoming_count = 0, RangeStats* statistics = nullptr) {
     minimum = std::max(1, minimum);
     if (maximum < minimum || graph.size() < static_cast<uint64_t>(minimum))
-        return false;
+        return CandidateStatus::Rejected;
     // A simple cycle cannot contain more vertices than the graph.
     maximum = static_cast<int>(std::min(static_cast<uint64_t>(maximum), graph.size()));
     const int shortest = shortest_cycle_length(graph, start, maximum, allowed,
                                                scratch, incomings, incoming_count);
-    if (shortest == 0) return false;
-    if (shortest >= minimum) return true;
+    if (shortest == 0) return CandidateStatus::Rejected;
+    if (shortest >= minimum) {
+        if (statistics) ++statistics->confirmed_roots;
+        return CandidateStatus::Confirmed;
+    }
     if (statistics) ++statistics->shorter_cycle_roots;
 
     if (!enough_reachable_nodes<true>(graph, start, static_cast<std::size_t>(minimum),
                                       allowed, scratch) ||
         !enough_reachable_nodes<false>(graph, start, static_cast<std::size_t>(minimum),
                                        allowed, scratch)) {
-        if (statistics) ++statistics->no_in_range_cycle;
-        return false;
+        if (statistics) ++statistics->rejected_small_region;
+        return CandidateStatus::Rejected;
     }
 
-    if (statistics) ++statistics->path_search_roots;
-    scratch.reset(graph.size());
-    auto push = [&](uint64_t node) {
-        typename Scratch<NodeId, Set>::PathFrame frame{};
-        frame.node = static_cast<NodeId>(node);
-        uint64_t neighbors[4];
-        const int count = graph.OutgoingEdges(node, neighbors);
-        if (count > 0) {
-            frame.count = static_cast<uint8_t>(count);
-            for (int i = 0; i < count; ++i)
-                frame.neighbors[i] = static_cast<NodeId>(neighbors[i]);
-        }
-        scratch.path.push_back(frame);
-        // Path marks are undone on every pop, including the successful exit.
-        // Do not append dirty-word entries on every DFS branch.
-        scratch.forward_bits[node >> 6] |= uint64_t{1} << (node & 63);
-    };
-    auto pop = [&]() {
-        const uint64_t node = scratch.path.back().node;
-        scratch.forward_bits[node >> 6] &= ~(uint64_t{1} << (node & 63));
-        scratch.path.pop_back();
-    };
-
-    push(start);
-    while (!scratch.path.empty()) {
-        auto& frame = scratch.path.back();
-        if (frame.next == frame.count) {
-            pop();
-            continue;
-        }
-        const uint64_t nb = frame.neighbors[frame.next++];
-        if (nb == start) {
-            // Closing a path with d distinct vertices makes a d-edge cycle.
-            if (scratch.path.size() >= static_cast<std::size_t>(minimum)) {
-                while (!scratch.path.empty()) pop();
-                return true;
-            }
-            continue;
-        }
-        if (scratch.path.size() == static_cast<std::size_t>(maximum) ||
-            scratch.forward_contains(nb) || !allowed(nb)) continue;
-        push(nb);
-    }
-    if (statistics) ++statistics->no_in_range_cycle;
-    return false;
+    if (statistics) ++statistics->needs_enumeration;
+    return CandidateStatus::NeedsEnumeration;
 }
 
 }  // namespace cycle_search

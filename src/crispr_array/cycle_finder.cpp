@@ -528,9 +528,10 @@ size_t CycleFinder::ChunkStartNodes(
                     auto allowed = [&](uint64_t neighbor) {
                         return graph.CycleMultiplicityAtLeast<full>(neighbor, minimum);
                     };
-                    if (mcaat::cycle_search::exists_in_range(graph, id,
+                    const auto candidate_status = mcaat::cycle_search::classify_candidate(graph, id,
                             minimum_length, limit, allowed, scratch,
-                            incomings, incoming_count, &worker.range_stats))
+                            incomings, incoming_count, &worker.range_stats);
+                    if (candidate_status != mcaat::cycle_search::CandidateStatus::Rejected)
                         worker.buckets[MultiplicityBucket(multiplicity)].push_back(id);
                 }
                 if (valid_in_chunk == 0) continue;
@@ -586,18 +587,21 @@ size_t CycleFinder::ChunkStartNodes(
     for (const auto& worker : workers) {
         candidates += worker.candidates;
         range_stats.shorter_cycle_roots += worker.range_stats.shorter_cycle_roots;
-        range_stats.no_in_range_cycle += worker.range_stats.no_in_range_cycle;
-        range_stats.path_search_roots += worker.range_stats.path_search_roots;
+        range_stats.rejected_small_region += worker.range_stats.rejected_small_region;
+        range_stats.confirmed_roots += worker.range_stats.confirmed_roots;
+        range_stats.needs_enumeration += worker.range_stats.needs_enumeration;
     }
     const double detection_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - detection_started).count();
     std::cout << "  ▸ Candidate scan + BFS + merge: " << detection_seconds
               << " s; valid edges checked " << completed_valid.load(std::memory_order_relaxed)
               << "; tested " << candidates << "; accepted " << total << std::endl;
-    std::cout << "  ▸ Range check: " << range_stats.shorter_cycle_roots
+    std::cout << "  ▸ Bounded range prefilter: " << range_stats.shorter_cycle_roots
               << " roots with shortest cycle below " << minimum_length
-              << "; rejected without an in-range cycle " << range_stats.no_in_range_cycle
-              << "; required exact path search " << range_stats.path_search_roots << std::endl;
+              << "; rejected small reachable regions " << range_stats.rejected_small_region
+              << "; confirmed in-range " << range_stats.confirmed_roots
+              << "; unresolved, retained for enumeration " << range_stats.needs_enumeration
+              << std::endl;
     return total;
 }
 
@@ -636,7 +640,8 @@ int CycleFinder::FindApproximateCRISPRArrays()
     // The upfront filter already invalidated every edge of multiplicity <= 1.
     // Tip pruning only invalidates more edges; it changes no multiplicities.
     const size_t start_nodes_amount = ChunkStartNodes(start_nodes_chunked, false);
-    std::cout << "  ▸ Start nodes: " << start_nodes_amount << std::endl;
+    std::cout << "  ▸ Start nodes: " << start_nodes_amount
+              << " (prefilter candidates; includes unresolved roots)" << std::endl;
 
     const auto enumeration_started = std::chrono::steady_clock::now();
     // Enumeration has independent state; BFS worker scratch has been released.
